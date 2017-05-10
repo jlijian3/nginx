@@ -86,7 +86,7 @@ struct ngx_ssl_connection_s {
     unsigned                    no_wait_shutdown:1;
     unsigned                    no_send_shutdown:1;
     unsigned                    handshake_buffer_set:1;
-    int							read_early_state;
+    int                         read_early_state;
 };
 
 
