@@ -435,15 +435,6 @@ ngx_http_wait_request_handler(ngx_event_t *rev)
     n = c->recv(c, b->last, size);
 
     if (n == NGX_AGAIN) {
-#if (NGX_HTTP_SSL)
-		if (hc->ssl &&
-			c->ssl &&
-			c->ssl->early_data_pending) {
-			c->ssl->early_data_pending = 0;
-			goto recv_early;
-		}
-#endif
-
         if (!rev->timer_set) {
             ngx_add_timer(rev, c->listening->post_accept_timeout);
             ngx_reusable_connection(c, 1);
@@ -478,9 +469,6 @@ ngx_http_wait_request_handler(ngx_event_t *rev)
     }
 
     b->last += n;
-#if (NGX_HTTP_SSL)
-recv_early:
-#endif
 
     if (hc->proxy_protocol) {
         hc->proxy_protocol = 0;

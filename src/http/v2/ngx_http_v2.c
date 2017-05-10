@@ -309,9 +309,6 @@ ngx_http_v2_read_handler(ngx_event_t *rev)
     ngx_connection_t          *c;
     ngx_http_v2_main_conf_t   *h2mcf;
     ngx_http_v2_connection_t  *h2c;
-#if (NGX_HTTP_SSL)
-	size_t					   early_data_size = 0;
-#endif
 
     c = rev->data;
     h2c = c->data;
@@ -361,24 +358,10 @@ ngx_http_v2_read_handler(ngx_event_t *rev)
         ngx_memcpy(p, h2c->state.buffer, NGX_HTTP_V2_STATE_BUFFER_SIZE);
         end = p + h2c->state.buffer_used;
 
-
-#if (NGX_HTTP_SSL)
-		if (h2c->http_connection->ssl &&
-			c->ssl &&
-			c->ssl->early_data_pending) {
-			early_data_size = c->buffer->last - c->buffer->start;
-			if (early_data_size > available)
-				early_data_size = available;
-			ngx_memcpy(end, c->buffer->start, early_data_size);
-			c->ssl->early_data_pending = 0;
-		}
-#endif
-
         n = c->recv(c, end, available);
 
         if (n == NGX_AGAIN) {
-			if (early_data_size == 0)
-            	break;
+            break;
         }
 
         if (n == 0 && (h2c->state.incomplete || h2c->processing)) {
@@ -392,7 +375,6 @@ ngx_http_v2_read_handler(ngx_event_t *rev)
             return;
         }
 
-        end += early_data_size;
         end += n;
 
         h2c->state.buffer_used = 0;

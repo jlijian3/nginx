@@ -1220,6 +1220,35 @@ ngx_ssl_set_session(ngx_connection_t *c, ngx_ssl_session_t *session)
 }
 #ifndef OPENSSL_IS_BORINGSSL
 static ngx_int_t
+ngx_ssl_read_early_data(ngx_connection_t *c,
+						u_char *buf,
+						size_t size,
+						size_t *readbytes)
+{
+	int errret;
+
+	if (!SSL_is_server(c->ssl->connection)) {
+		return 0;
+    }
+
+    if (c->ssl->read_early_state == SSL_READ_EARLY_DATA_FINISH) {
+        return 0;
+    }
+
+	errret = SSL_read_early_data(c->ssl->connection, buf,
+								 size, readbytes);
+	c->ssl->read_early_state = errret;
+
+    ngx_log_debug3(NGX_LOG_DEBUG_EVENT, c->log, 0,
+    	"SSL_read_early_data: %d readbytes: %d "
+		"early_data_status: %d",
+		errret, *readbytes,
+		SSL_get_early_data_status(c->ssl->connection));
+
+	return errret;
+}
+
+static ngx_int_t
 ngx_ssl_handshake_early_data(ngx_connection_t *c)
 {
 #if OPENSSL_VERSION_NUMBER < 0x10101000L
@@ -1237,8 +1266,8 @@ ngx_ssl_handshake_early_data(ngx_connection_t *c)
         return 0;
     }
 
-    b = c->buffer;
-    size = SSL_CTX_get_max_early_data(c->ssl->session_ctx);
+    b = c->ssl->early_buf;
+    size = SSL_get_max_early_data(c->ssl->connection);
     if (size == 0) {
 	    return 0;
     }
@@ -1249,7 +1278,7 @@ ngx_ssl_handshake_early_data(ngx_connection_t *c)
             return 0;
         }
 
-        c->buffer = b;
+        c->ssl->early_buf = b;
 
     } else if (b->start == NULL) {
 
@@ -1263,22 +1292,15 @@ ngx_ssl_handshake_early_data(ngx_connection_t *c)
         b->end = b->last + size;
     }
 
-    errret = SSL_read_early_data(c->ssl->connection, b->last,
-								 size, &readbytes);
-	c->ssl->read_early_state = errret;
 
-    ngx_log_debug4(NGX_LOG_DEBUG_EVENT, c->log, 0,
-    	"SSL_read_early_data: %d max_size: %d readbytes: %d "
-		"early_data_status: %d",
-		errret, size, readbytes,
-		SSL_get_early_data_status(c->ssl->connection));
+
+    errret = ngx_ssl_read_early_data(c, b->last,
+								 	 size, &readbytes);
+	if (readbytes > 0) {
+		b->last += readbytes;
+	}
 
     if (errret != SSL_READ_EARLY_DATA_ERROR) {
-	    if (readbytes > 0) {
-			c->ssl->early_data_pending = 1;
-		    b->last += readbytes;
-	    }
-
 	    if (SSL_get_early_data_status(c->ssl->connection) ==
 			SSL_EARLY_DATA_ACCEPTED) {
 		    switch (errret) {
@@ -1298,8 +1320,6 @@ ngx_ssl_handshake_early_data(ngx_connection_t *c)
 	case SSL_ERROR_WANT_ASYNC:
 	case SSL_ERROR_WANT_READ:
             break; 
- 
-
 	default:
 	    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0,
 	    	"SSL_get_error: %d while reading early data\n", sslerr);
@@ -1414,8 +1434,6 @@ ngx_ssl_handshake(ngx_connection_t *c)
     sslerr = SSL_get_error(c->ssl->connection, n);
 
     ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0, "SSL_get_error: %d", sslerr);
-    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0, "read_early_state: %d",
-		c->ssl->read_early_state);
 
     if (sslerr == SSL_ERROR_WANT_READ
 		|| (sslerr == SSL_ERROR_NONE &&
@@ -1580,6 +1598,30 @@ ngx_ssl_recv(ngx_connection_t *c, u_char *buf, size_t size)
      */
 
     for ( ;; ) {
+#if !defined(OPENSSL_IS_BORINGSSL) && (OPENSSL_VERSION_NUMBER >= 0x10101000L)
+		if (c->ssl->early_buf &&
+			c->ssl->early_buf->start &&
+			(c->ssl->early_buf->last > c->ssl->early_buf->pos)) {
+			n = c->ssl->early_buf->last - c->ssl->early_buf->pos;
+			if (n > (int)size)
+				n = size;
+			ngx_memcpy(buf, c->ssl->early_buf->start, n);
+			c->ssl->early_buf->pos += n;
+			return n;
+		}
+
+		if (!SSL_is_init_finished(c->ssl->connection) &&
+			(c->ssl->read_early_state != SSL_READ_EARLY_DATA_FINISH) &&
+			(SSL_get_early_data_status(c->ssl->connection) ==
+		 	 SSL_EARLY_DATA_ACCEPTED)) {
+			size_t readbytes = 0;
+			n = ngx_ssl_read_early_data(c, buf, size, &readbytes);
+			if (readbytes > 0)
+				n = readbytes;
+			else if (n == SSL_READ_EARLY_DATA_FINISH)
+        		n = SSL_read(c->ssl->connection, buf, size);
+		} else
+#endif
         n = SSL_read(c->ssl->connection, buf, size);
 
         ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0, "SSL_read: %d", n);
@@ -1637,7 +1679,8 @@ ngx_ssl_handle_recv(ngx_connection_t *c, int n)
     int        sslerr;
     ngx_err_t  err;
 
-    if (c->ssl->renegotiation) {
+    if (c->ssl->renegotiation &&
+		(SSL_version(c->ssl->connection) != TLS1_3_VERSION)) {
         /*
          * disable renegotiation (CVE-2009-3555):
          * OpenSSL (at least up to 0.9.8l) does not handle disabled
@@ -1912,16 +1955,17 @@ ngx_ssl_write(ngx_connection_t *c, u_char *data, size_t size)
 
 #if !defined(OPENSSL_IS_BORINGSSL) && (OPENSSL_VERSION_NUMBER >= 0x10101000L)
 	if (!SSL_is_init_finished(c->ssl->connection) &&
-		(c->ssl->read_early_state == SSL_READ_EARLY_DATA_SUCCESS) &&
 		(SSL_get_early_data_status(c->ssl->connection) ==
 		 SSL_EARLY_DATA_ACCEPTED)) {
 		size_t wrttenbytes = 0;
 		n = SSL_write_early_data(c->ssl->connection, data, size, &wrttenbytes);
+		/*
+		c->ssl->read_early_state = SSL_READ_EARLY_DATA_FINISH;
+		*/
     	ngx_log_debug2(NGX_LOG_DEBUG_EVENT, c->log, 0,
 			"SSL_write_early_data: %d written: %d", n, wrttenbytes);
-		if (n && wrttenbytes > 0)
+		if (wrttenbytes > 0)
 			n = wrttenbytes;
-
 	} else
 #endif
     n = SSL_write(c->ssl->connection, data, size);
@@ -2009,6 +2053,12 @@ ngx_ssl_free_buffer(ngx_connection_t *c)
     if (c->ssl->buf && c->ssl->buf->start) {
         if (ngx_pfree(c->pool, c->ssl->buf->start) == NGX_OK) {
             c->ssl->buf->start = NULL;
+        }
+    }
+
+	if (c->ssl->early_buf && c->ssl->early_buf->start) {
+        if (ngx_pfree(c->pool, c->ssl->early_buf->start) == NGX_OK) {
+            c->ssl->early_buf->start = NULL;
         }
     }
 }
